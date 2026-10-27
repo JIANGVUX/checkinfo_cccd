@@ -11,7 +11,7 @@ from PIL import Image, ImageOps
 
 from cccd import decode_so_cccd, kiem_tra_khop, parse_cccd
 from qr_html import QR_HTML
-from scanner import decode_image, is_cccd
+from scanner import decode_image, is_cccd, pad_quiet_zone
 
 st.set_page_config(page_title="Quét QR CCCD", page_icon="🪪", layout="centered")
 
@@ -48,14 +48,24 @@ def set_result(raw: str, method: str):
     st.rerun()
 
 
-def scan_bgr(bgr):
+def scan_bgr(bgr, crop=False, orig_size=None):
+    """crop=True: bgr là vùng người dùng đã chọn (sẽ được thêm viền trắng quanh)."""
+    src = pad_quiet_zone(bgr) if crop else bgr
     with st.spinner("Đang quét (ảnh mờ có thể mất vài giây)..."):
-        r = decode_image(bgr)
+        r = decode_image(src)
     if r["raw"] and r["ok"]:
-        set_result(r["raw"], r["method"])
+        set_result(r["raw"], ("vùng chọn · " if crop else "") + r["method"])
     elif r["raw"]:
         st.warning("Có mã QR nhưng không phải QR của CCCD.")
         st.code(r["raw"])
+    elif crop:
+        w = bgr.shape[1]
+        st.error("Không đọc được mã QR trong vùng đã chọn.")
+        st.info(
+            f"Vùng chọn rộng khoảng {w} px, ước tính ≈ {w / 55:.1f} px cho mỗi ô QR "
+            "(cần tối thiểu khoảng 1,5 px). Nếu con số này quá thấp thì ảnh gốc không đủ chi tiết, "
+            "cần xin ảnh HD hoặc ảnh gốc. Nếu con số ổn, hãy chọn lại vùng cho ôm đúng mã QR."
+        )
     else:
         st.error("Không đọc được mã QR.")
         longest = max(r["w"], r["h"])
@@ -63,15 +73,45 @@ def scan_bgr(bgr):
             st.info(
                 f"Ảnh chỉ {r['w']}×{r['h']} px, **quá nhỏ**: mã QR của CCCD rất dày nên cần "
                 f"ảnh có cạnh dài từ {MIN_SIDE_OK} px trở lên (điện thoại thường 3000–4000 px). "
-                "Nếu ảnh nhận qua Zalo: nhờ người gửi bật chế độ **ảnh HD / ảnh gốc** hoặc gửi "
-                "**dạng file (tài liệu)**, hoặc quét trực tiếp thẻ thật ở tab **Quét trực tiếp**."
+                "Hãy thử bật **Tự chọn vùng chứa mã QR** ở trên. Nếu ảnh nhận qua Zalo, nhờ người gửi "
+                "bật chế độ **ảnh HD / ảnh gốc** hoặc gửi **dạng file (tài liệu)**."
             )
         else:
             nhan = "rất mờ" if r["sharp"] < 30 else ("hơi mờ" if r["sharp"] < 100 else "khá nét")
             st.info(
                 f"Ảnh {r['w']}×{r['h']} px, độ nét {r['sharp']:.0f} ({nhan}). "
-                "Hãy chụp gần hơn để mã QR chiếm khoảng 1/3 khung hình, đủ sáng, tránh chói."
+                "Hãy thử **chọn vùng chứa mã QR**, hoặc chụp gần hơn, đủ sáng, tránh chói."
             )
+
+
+def pick_region(img: Image.Image, key: str) -> Image.Image:
+    """Cho người dùng khoanh vùng mã QR. Trả về ảnh PIL đã cắt, giữ nguyên độ phân giải gốc."""
+    W, H = img.size
+    prev = img.copy()
+    prev.thumbnail((1000, 1000))
+    try:
+        from streamlit_cropper import st_cropper
+
+        st.caption("Kéo khung xanh (kéo góc/cạnh để đổi kích thước) cho ôm sát mã QR.")
+        box = st_cropper(prev, realtime_update=True, box_color="#00E676",
+                         return_type="box", key=f"cropper_{key}")
+        sx, sy = W / prev.width, H / prev.height
+        l, t = int(box["left"] * sx), int(box["top"] * sy)
+        w, h = int(box["width"] * sx), int(box["height"] * sy)
+        l, t = max(l, 0), max(t, 0)
+        r, btm = min(l + w, W), min(t + h, H)
+        if r - l >= 20 and btm - t >= 20:
+            return img.crop((l, t, r, btm))
+        return img
+    except Exception:
+        # Dự phòng: thanh trượt (không cần thư viện ngoài)
+        st.caption("Kéo thanh trượt để chọn vùng chứa mã QR.")
+        x = st.slider("Ngang (trái–phải), %", 0, 100, (0, 100), key=f"sx_{key}")
+        y = st.slider("Dọc (trên–dưới), %", 0, 100, (0, 100), key=f"sy_{key}")
+        if x[1] - x[0] < 3 or y[1] - y[0] < 3:
+            return img
+        return img.crop((int(W * x[0] / 100), int(H * y[0] / 100),
+                         int(W * x[1] / 100), int(H * y[1] / 100)))
 
 
 def show_result(raw: str):
@@ -134,13 +174,24 @@ if st.session_state.raw is None:
     with tab_up:
         st.write(
             "Trên điện thoại: bấm chọn file rồi chọn **Chụp ảnh** để dùng camera gốc "
-            "(ảnh lớn, tự lấy nét). Đừng dùng ảnh đã gửi qua Zalo/Messenger vì bị nén nhỏ."
+            "(ảnh lớn, tự lấy nét). Ảnh nhận qua Zalo thường bị nén nhỏ nên khó quét hơn."
         )
         f = st.file_uploader("Ảnh mặt sau CCCD (có mã QR)", type=["jpg", "jpeg", "png", "webp"])
         if f:
-            img = Image.open(f)
-            st.image(img, caption=f"Ảnh đầu vào ({img.width}×{img.height} px)", width=400)
-            scan_bgr(pil_to_bgr(img))
+            img = ImageOps.exif_transpose(Image.open(f)).convert("RGB")
+            st.caption(f"Ảnh gốc: {img.width}×{img.height} px")
+            use_crop = st.checkbox(
+                "✂️ Tự chọn vùng chứa mã QR (khuyên dùng khi ảnh nhỏ, mờ hoặc nhiều chi tiết)",
+                value=True,
+            )
+            if use_crop:
+                region = pick_region(img, key=f"{f.name}_{f.size}")
+                st.image(region, caption=f"Vùng sẽ quét: {region.width}×{region.height} px", width=300)
+                if st.button("🔍 Quét vùng này", type="primary"):
+                    scan_bgr(pil_to_bgr(region), crop=True)
+            else:
+                st.image(img, caption="Ảnh đầu vào", width=400)
+                scan_bgr(pil_to_bgr(img))
 else:
     show_result(st.session_state.raw)
     if st.session_state.get("method"):

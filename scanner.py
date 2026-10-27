@@ -194,7 +194,7 @@ def _stages(gray):
     yield "làm nét", sh
 
     # Ảnh nhỏ/bị nén (kiểu Zalo): phóng to rồi mới làm nét -> đọc được cả QR ~1.5px/ô
-    for f in (2, 3, 4):
+    for f in (2, 3, 4, 6, 8):
         if m * f <= 3200:
             up = cv2.resize(gray, None, fx=f, fy=f, interpolation=cv2.INTER_LANCZOS4)
             yield f"phóng to {f}x + làm nét", _unsharp(up, 1.5, f * 1.2)
@@ -218,6 +218,15 @@ def _stages(gray):
     yield "cắt vùng giữa", crop
     yield "cắt giữa + phóng to", cv2.resize(_unsharp(crop), None, fx=2, fy=2,
                                               interpolation=cv2.INTER_CUBIC)
+
+
+def pad_quiet_zone(bgr, ratio=0.12):
+    """Thêm viền sáng quanh vùng đã cắt: QR cần vùng trống (quiet zone) mới đọc được."""
+    gray = _to_gray(bgr)
+    bg = int(np.percentile(gray, 90))
+    p = max(8, int(max(gray.shape[:2]) * ratio))
+    val = bg if bgr.ndim == 2 else (bg, bg, bg)
+    return cv2.copyMakeBorder(bgr, p, p, p, p, cv2.BORDER_CONSTANT, value=val)
 
 
 # ---------- API ----------
