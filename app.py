@@ -24,19 +24,35 @@ RTC_CONFIG = {
 
 # ---------- Quét video trực tiếp ----------
 class QRProcessor(VideoProcessorBase):
+    """Khung hình hiển thị mượt; việc quét chạy ở luồng nền trên khung mới nhất."""
+
     def __init__(self):
         self.lock = threading.Lock()
+        self.latest = None
         self.result = None
-        self.n = 0
+        self._stop = False
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        last = None
+        while not self._stop and self.result is None:
+            with self.lock:
+                frame = self.latest
+            if frame is None or frame is last:
+                time.sleep(0.02)
+                continue
+            last = frame
+            raw = fast_decode(frame)
+            if raw:
+                self.result = raw
+
+    def on_ended(self):
+        self._stop = True
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
-        self.n += 1
-        if self.result is None and self.n % 3 == 0:  # quét mỗi 3 khung hình
-            raw = fast_decode(img)
-            if raw:
-                with self.lock:
-                    self.result = raw
+        with self.lock:
+            self.latest = img.copy()
         if self.result is not None:
             h, w = img.shape[:2]
             cv2.rectangle(img, (4, 4), (w - 4, h - 4), (0, 200, 0), 8)
@@ -46,6 +62,26 @@ class QRProcessor(VideoProcessorBase):
 def pil_to_bgr(pil: Image.Image):
     pil = ImageOps.exif_transpose(pil).convert("RGB")
     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+
+
+def handle_scan(img_pil):
+    with st.spinner("Đang quét (ảnh mờ có thể mất vài giây)..."):
+        r = decode_image(pil_to_bgr(img_pil))
+    if r["raw"] and r["ok"]:
+        st.session_state.raw = r["raw"]
+        st.session_state.method = r["method"]
+        st.rerun()
+    elif r["raw"]:
+        st.warning("Có mã QR nhưng không phải QR của CCCD.")
+        st.code(r["raw"])
+    else:
+        st.error("Không đọc được mã QR.")
+        nhan = "RẤT MỜ" if r["sharp"] < 30 else ("hơi mờ" if r["sharp"] < 100 else "khá nét")
+        st.info(
+            f"Ảnh {r['w']}×{r['h']} px, độ nét {r['sharp']:.0f} ({nhan}).\n\n"
+            "Cách khắc phục: dùng ảnh gốc từ camera điện thoại (không qua Zalo/Messenger vì bị nén), "
+            "chụp gần để mã QR chiếm ít nhất 1/3 khung hình, bật đèn, tránh chói, giữ tay vững."
+        )
 
 
 def show_result(raw: str):
@@ -82,6 +118,7 @@ st.caption("Đọc và hiển thị toàn bộ thông tin trong mã QR trên că
 
 if "raw" not in st.session_state:
     st.session_state.raw = None
+    st.session_state.method = None
 
 tab_live, tab_cam, tab_up = st.tabs(["⚡ Quét trực tiếp", "📷 Chụp ảnh", "📁 Tải ảnh lên"])
 
@@ -97,8 +134,9 @@ with tab_live:
             media_stream_constraints={
                 "video": {
                     "facingMode": "environment",
-                    "width": {"ideal": 1280},
-                    "height": {"ideal": 720},
+                    "width": {"ideal": 1920},
+                    "height": {"ideal": 1080},
+                    "advanced": [{"focusMode": "continuous"}],
                 },
                 "audio": False,
             },
@@ -118,37 +156,26 @@ with tab_live:
 
 # --- Tab 2: chụp ảnh ---
 with tab_cam:
+    st.caption("Trên điện thoại, tab **Tải ảnh lên** cho ảnh gốc độ phân giải cao hơn nút chụp này.")
     shot = st.camera_input("Đưa mã QR vào giữa khung, giữ nét rồi chụp")
     if shot:
-        with st.spinner("Đang quét..."):
-            raw, ok = decode_image(pil_to_bgr(Image.open(shot)))
-        if raw and ok:
-            st.session_state.raw = raw
-            st.rerun()
-        elif raw:
-            st.warning("Có mã QR nhưng không phải QR của CCCD.")
-            st.code(raw)
-        else:
-            st.error("Không đọc được. Hãy chụp gần hơn, đủ sáng, tránh chói và mờ.")
+        handle_scan(Image.open(shot))
 
-# --- Tab 3: tải ảnh ---
+# --- Tab 3: tải ảnh / chụp bằng camera gốc ---
 with tab_up:
-    f = st.file_uploader("Chọn ảnh mặt sau CCCD (có mã QR)", type=["jpg", "jpeg", "png", "webp"])
+    st.write("Trên điện thoại, bấm chọn rồi chọn **Chụp ảnh**: dùng camera gốc, tự lấy nét, ảnh rất nét.")
+    f = st.file_uploader("Ảnh mặt sau CCCD (có mã QR)", type=["jpg", "jpeg", "png", "webp"])
     if f:
         img = Image.open(f)
         st.image(img, caption="Ảnh đầu vào", width=400)
-        with st.spinner("Đang quét..."):
-            raw, ok = decode_image(pil_to_bgr(img))
-        if raw and ok:
-            st.session_state.raw = raw
-            st.rerun()
-        elif raw:
-            st.warning("Có mã QR nhưng không phải QR của CCCD.")
-            st.code(raw)
-        else:
-            st.error("Không đọc được. Hãy dùng ảnh rõ nét, đủ sáng.")
+        handle_scan(img)
 
 # --- Kết quả ---
 if st.session_state.raw:
     st.divider()
     show_result(st.session_state.raw)
+    if st.session_state.get("method"):
+        st.caption(f"Đọc bằng: {st.session_state.method}")
+    if st.button("🔄 Quét thẻ khác", key="reset_bottom"):
+        st.session_state.raw = None
+        st.rerun()
