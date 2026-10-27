@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+*.jpg
+*.jpeg
+*.png
+*.csv
+.streamlit/secrets.toml

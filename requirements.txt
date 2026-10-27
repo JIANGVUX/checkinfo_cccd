@@ -1,0 +1,9 @@
+streamlit>=1.35
+streamlit-webrtc>=0.47
+av
+opencv-python-headless
+numpy
+pandas
+Pillow
+zxing-cpp
+pyzbar
