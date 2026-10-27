@@ -11,7 +11,7 @@ from PIL import Image, ImageOps
 
 from cccd import decode_so_cccd, kiem_tra_khop, parse_cccd
 from qr_html import QR_HTML
-from scanner import decode_image, is_cccd, pad_quiet_zone
+from scanner import decode_image, diagnose, is_cccd, pad_quiet_zone
 
 st.set_page_config(page_title="Quét QR CCCD", page_icon="🪪", layout="centered")
 
@@ -48,6 +48,34 @@ def set_result(raw: str, method: str):
     st.rerun()
 
 
+def show_diag(bgr):
+    """Bảng chẩn đoán: cho thấy bộ quét 'nhìn' ảnh ra sao và vì sao có thể thất bại."""
+    d = diagnose(bgr)
+    with st.expander("🔎 Chẩn đoán chi tiết (xem ảnh mà bộ quét nhìn thấy)", expanded=True):
+        st.image(d["view"], caption="Vùng quét sau khi phóng to + làm nét. Bạn có thấy rõ từng ô vuông nhỏ không?",
+                 clamp=True)
+        hints = []
+        if not d["frame_found"]:
+            hints.append("❌ Không tìm thấy 3 ô vuông định vị ở 3 góc của mã QR: vùng chọn có thể "
+                         "chưa chứa đủ mã QR (bị cắt mất góc), mã bị che, hoặc quá nhòe.")
+        else:
+            hints.append("✅ Đã thấy khung mã QR nhưng không giải mã được: các ô bên trong bị nhòe, nhiễu hoặc chói.")
+        if d["saturated"] > 0.05:
+            hints.append(f"⚠️ {d['saturated'] * 100:.0f}% điểm ảnh bị cháy sáng (chói đèn/phản quang). "
+                         "Phần cháy trắng đã mất dữ liệu. Hãy chụp lại, nghiêng thẻ nhẹ để tránh phản chiếu.")
+        if d["contrast"] < 60:
+            hints.append(f"⚠️ Tương phản thấp ({d['contrast']:.0f}/255): ảnh bị xám/nhạt, cần chụp đủ sáng hơn.")
+        if d["sharp"] < 30:
+            hints.append("⚠️ Ảnh rất mờ (nhòe do rung tay hoặc lấy nét sai).")
+        for h in hints:
+            st.write(h)
+        st.caption(
+            f"Kỹ thuật: zxing={'có' if d['zxing'] else 'KHÔNG'}, wechat={'có' if d['wechat'] else 'KHÔNG'}"
+            f"{' (có siêu phân giải)' if d['wechat_sr'] else ''}, zbar={'có' if d['zbar'] else 'KHÔNG'}, "
+            f"opencv {d['opencv']}"
+        )
+
+
 def scan_bgr(bgr, crop=False, orig_size=None):
     """crop=True: bgr là vùng người dùng đã chọn (sẽ được thêm viền trắng quanh)."""
     src = pad_quiet_zone(bgr) if crop else bgr
@@ -62,10 +90,12 @@ def scan_bgr(bgr, crop=False, orig_size=None):
         w = bgr.shape[1]
         st.error("Không đọc được mã QR trong vùng đã chọn.")
         st.info(
-            f"Vùng chọn rộng khoảng {w} px, ước tính ≈ {w / 55:.1f} px cho mỗi ô QR "
-            "(cần tối thiểu khoảng 1,5 px). Nếu con số này quá thấp thì ảnh gốc không đủ chi tiết, "
-            "cần xin ảnh HD hoặc ảnh gốc. Nếu con số ổn, hãy chọn lại vùng cho ôm đúng mã QR."
+            f"Vùng chọn rộng khoảng {w} px, ước tính ≈ {w / 61:.1f} px cho mỗi ô QR "
+            "(cần tối thiểu khoảng 1,5 px). Nếu con số thấp thì ảnh gốc không đủ chi tiết, "
+            "cần xin ảnh HD hoặc ảnh gốc. Nếu con số ổn thì nguyên nhân thường là chói, mờ nhòe "
+            "hoặc vùng chọn chưa ôm đủ mã QR: xem bảng chẩn đoán bên dưới."
         )
+        show_diag(src)
     else:
         st.error("Không đọc được mã QR.")
         longest = max(r["w"], r["h"])
@@ -76,12 +106,14 @@ def scan_bgr(bgr, crop=False, orig_size=None):
                 "Hãy thử bật **Tự chọn vùng chứa mã QR** ở trên. Nếu ảnh nhận qua Zalo, nhờ người gửi "
                 "bật chế độ **ảnh HD / ảnh gốc** hoặc gửi **dạng file (tài liệu)**."
             )
+            show_diag(src)
         else:
             nhan = "rất mờ" if r["sharp"] < 30 else ("hơi mờ" if r["sharp"] < 100 else "khá nét")
             st.info(
                 f"Ảnh {r['w']}×{r['h']} px, độ nét {r['sharp']:.0f} ({nhan}). "
                 "Hãy thử **chọn vùng chứa mã QR**, hoặc chụp gần hơn, đủ sáng, tránh chói."
             )
+            show_diag(src)
 
 
 def pick_region(img: Image.Image, key: str) -> Image.Image:

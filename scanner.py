@@ -176,6 +176,25 @@ def _wiener(gray, sigma, K=0.01):
     return np.clip(f * 255, 0, 255).astype(np.uint8)
 
 
+def _flatten(gray):
+    """Loại bỏ chênh lệch sáng: chia ảnh cho nền (ước lượng bằng closing + làm mờ)."""
+    k = max(15, int(max(gray.shape[:2]) * 0.12)) | 1
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    bg = cv2.GaussianBlur(cv2.morphologyEx(gray, cv2.MORPH_CLOSE, se), (0, 0), 5).astype(np.float32)
+    out = gray.astype(np.float32) / np.maximum(bg, 1)
+    return cv2.normalize(out, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+
+def _channel_images(bgr):
+    """Thẻ có nền màu/ám màu: thử từng kênh màu thay vì chỉ ảnh xám."""
+    if bgr.ndim == 2:
+        return []
+    b, g, r = cv2.split(bgr)
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[:, :, 0]
+    return [("kênh đỏ", r), ("kênh xanh lá", g), ("kênh xanh dương", b),
+            ("kênh sáng (Lab)", lab), ("kênh tối nhất", np.minimum(np.minimum(b, g), r))]
+
+
 def _stages(gray):
     h, w = gray.shape[:2]
     m = max(h, w)
@@ -205,6 +224,16 @@ def _stages(gray):
     yield "nhị phân Otsu", otsu
     yield "nhị phân thích ứng", cv2.adaptiveThreshold(
         sh, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 8)
+
+    # Ảnh chụp thẻ hay bị lệch sáng/chói: chia cho nền ước lượng để làm phẳng ánh sáng
+    fl = _flatten(gray)
+    yield "làm phẳng ánh sáng", fl
+    if m < 1200:
+        up3 = cv2.resize(fl, None, fx=3, fy=3, interpolation=cv2.INTER_LANCZOS4)
+        yield "làm phẳng + phóng to 3x", up3
+        yield "làm phẳng + phóng to 3x + nhị phân", cv2.adaptiveThreshold(
+            up3, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 61, 6)
+    yield "đảo màu", 255 - gray
 
     # Khử mờ trên ảnh vừa phải để nhanh
     base = _limit_size(gray, 1100)
@@ -242,17 +271,76 @@ def fast_decode(bgr):
 
 def decode_image(bgr, budget: float = 8.0) -> dict:
     """Quét ảnh tĩnh. Trả về dict: raw, ok, method, w, h, sharp."""
-    gray = _limit_size(_to_gray(np.ascontiguousarray(bgr)))
+    bgr = np.ascontiguousarray(bgr)
+    gray = _limit_size(_to_gray(bgr))
     out = {"raw": None, "ok": False, "method": None,
            "w": bgr.shape[1], "h": bgr.shape[0], "sharp": sharpness(gray)}
     t0 = time.time()
-    for stage, img in _stages(gray):
+
+    def run(img, prefix=""):
         for dec, text in _candidates(img):
             if is_cccd(text):
-                out.update(raw=text, ok=True, method=f"{dec} · {stage}")
-                return out
+                out.update(raw=text, ok=True, method=f"{dec} · {prefix}")
+                return True
             if out["raw"] is None:
-                out.update(raw=text, method=f"{dec} · {stage}")
+                out.update(raw=text, method=f"{dec} · {prefix}")
+        return False
+
+    for stage, img in _stages(gray):
+        if run(img, stage):
+            return out
         if time.time() - t0 > budget:
+            return out
+
+    # Chưa được: thử từng kênh màu với vài bước quan trọng
+    for cname, ch in _channel_images(_limit_size(bgr)):
+        if time.time() - t0 > budget * 1.6:
             break
+        for stage, img in _stages_light(ch):
+            if run(img, f"{cname} · {stage}"):
+                return out
     return out
+
+
+def _stages_light(ch):
+    h, w = ch.shape[:2]
+    yield "gốc", ch
+    yield "làm nét", _unsharp(ch)
+    yield "làm phẳng ánh sáng", _flatten(ch)
+    for f in (3, 4):
+        if max(h, w) * f <= 3200:
+            yield f"phóng to {f}x + làm nét", _unsharp(
+                cv2.resize(ch, None, fx=f, fy=f, interpolation=cv2.INTER_LANCZOS4), 1.5, f * 1.2)
+
+
+def diagnose(bgr) -> dict:
+    """Thông tin giúp biết vì sao không quét được."""
+    bgr = np.ascontiguousarray(bgr)
+    gray = _to_gray(bgr)
+    h, w = gray.shape[:2]
+    info = {
+        "w": w, "h": h,
+        "zxing": zxingcpp is not None,
+        "wechat": bool(_get_wechat()),
+        "wechat_sr": WECHAT_SR,
+        "zbar": zbar_decode is not None,
+        "opencv": cv2.__version__,
+        "sharp": sharpness(gray),
+        "contrast": float(np.percentile(gray, 95) - np.percentile(gray, 5)),
+        "saturated": float((gray >= 250).mean()),
+        "dark": float((gray <= 5).mean()),
+    }
+    found = False
+    for f in (1, 2, 3):
+        g = cv2.resize(gray, None, fx=f, fy=f, interpolation=cv2.INTER_CUBIC) if f > 1 else gray
+        try:
+            ok, _ = _std.detect(g)
+        except Exception:
+            ok = False
+        if ok:
+            found = True
+            break
+    info["frame_found"] = found
+    up = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_LANCZOS4) if max(h, w) * 3 <= 3200 else gray
+    info["view"] = _unsharp(up, 1.2, 3)
+    return info
