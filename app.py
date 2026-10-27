@@ -1,62 +1,24 @@
-import threading
-import time
+import base64
+from pathlib import Path
 
-import av
 import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageOps
-from streamlit_webrtc import VideoProcessorBase, WebRtcMode, webrtc_streamer
 
 from cccd import decode_so_cccd, kiem_tra_khop, parse_cccd
-from scanner import decode_image, fast_decode
+from scanner import decode_image, is_cccd
 
 st.set_page_config(page_title="Quét QR CCCD", page_icon="🪪", layout="centered")
 
-RTC_CONFIG = {
-    "iceServers": [
-        {"urls": ["stun:stun.l.google.com:19302"]},
-        {"urls": ["stun:stun1.l.google.com:19302"]},
-    ]
-}
+# Component quét ngay trong trình duyệt (camera độ phân giải cao)
+qr_live = components.declare_component(
+    "qr_live", path=str(Path(__file__).parent / "qr_component")
+)
 
-
-# ---------- Quét video trực tiếp ----------
-class QRProcessor(VideoProcessorBase):
-    """Khung hình hiển thị mượt; việc quét chạy ở luồng nền trên khung mới nhất."""
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.latest = None
-        self.result = None
-        self._stop = False
-        threading.Thread(target=self._worker, daemon=True).start()
-
-    def _worker(self):
-        last = None
-        while not self._stop and self.result is None:
-            with self.lock:
-                frame = self.latest
-            if frame is None or frame is last:
-                time.sleep(0.02)
-                continue
-            last = frame
-            raw = fast_decode(frame)
-            if raw:
-                self.result = raw
-
-    def on_ended(self):
-        self._stop = True
-
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        with self.lock:
-            self.latest = img.copy()
-        if self.result is not None:
-            h, w = img.shape[:2]
-            cv2.rectangle(img, (4, 4), (w - 4, h - 4), (0, 200, 0), 8)
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+MIN_SIDE_OK = 1000  # cạnh dài tối thiểu để đọc được QR dày của CCCD
 
 
 def pil_to_bgr(pil: Image.Image):
@@ -64,24 +26,42 @@ def pil_to_bgr(pil: Image.Image):
     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
 
-def handle_scan(img_pil):
+def data_url_to_bgr(data_url: str):
+    b = base64.b64decode(data_url.split(",", 1)[1])
+    arr = np.frombuffer(b, np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
+def set_result(raw: str, method: str):
+    st.session_state.raw = raw
+    st.session_state.method = method
+    st.rerun()
+
+
+def scan_bgr(bgr):
     with st.spinner("Đang quét (ảnh mờ có thể mất vài giây)..."):
-        r = decode_image(pil_to_bgr(img_pil))
+        r = decode_image(bgr)
     if r["raw"] and r["ok"]:
-        st.session_state.raw = r["raw"]
-        st.session_state.method = r["method"]
-        st.rerun()
+        set_result(r["raw"], r["method"])
     elif r["raw"]:
         st.warning("Có mã QR nhưng không phải QR của CCCD.")
         st.code(r["raw"])
     else:
         st.error("Không đọc được mã QR.")
-        nhan = "RẤT MỜ" if r["sharp"] < 30 else ("hơi mờ" if r["sharp"] < 100 else "khá nét")
-        st.info(
-            f"Ảnh {r['w']}×{r['h']} px, độ nét {r['sharp']:.0f} ({nhan}).\n\n"
-            "Cách khắc phục: dùng ảnh gốc từ camera điện thoại (không qua Zalo/Messenger vì bị nén), "
-            "chụp gần để mã QR chiếm ít nhất 1/3 khung hình, bật đèn, tránh chói, giữ tay vững."
-        )
+        longest = max(r["w"], r["h"])
+        if longest < MIN_SIDE_OK:
+            st.info(
+                f"Ảnh chỉ {r['w']}×{r['h']} px, **quá nhỏ**: mã QR của CCCD rất dày nên cần "
+                f"ảnh có cạnh dài từ {MIN_SIDE_OK} px trở lên (điện thoại thường 3000–4000 px). "
+                "Nếu ảnh nhận qua Zalo: nhờ người gửi bật chế độ **ảnh HD / ảnh gốc** hoặc gửi "
+                "**dạng file (tài liệu)**, hoặc quét trực tiếp thẻ thật ở tab **Quét trực tiếp**."
+            )
+        else:
+            nhan = "rất mờ" if r["sharp"] < 30 else ("hơi mờ" if r["sharp"] < 100 else "khá nét")
+            st.info(
+                f"Ảnh {r['w']}×{r['h']} px, độ nét {r['sharp']:.0f} ({nhan}). "
+                "Hãy chụp gần hơn để mã QR chiếm khoảng 1/3 khung hình, đủ sáng, tránh chói."
+            )
 
 
 def show_result(raw: str):
@@ -116,66 +96,45 @@ def show_result(raw: str):
 st.title("🪪 Quét QR CCCD")
 st.caption("Đọc và hiển thị toàn bộ thông tin trong mã QR trên căn cước công dân.")
 
-if "raw" not in st.session_state:
-    st.session_state.raw = None
-    st.session_state.method = None
+for k, v0 in (("raw", None), ("method", None), ("qk", 0), ("last_t", None)):
+    st.session_state.setdefault(k, v0)
 
-tab_live, tab_cam, tab_up = st.tabs(["⚡ Quét trực tiếp", "📷 Chụp ảnh", "📁 Tải ảnh lên"])
+if st.session_state.raw is None:
+    tab_live, tab_up = st.tabs(["⚡ Quét trực tiếp (khuyên dùng)", "📁 Chụp / tải ảnh"])
 
-# --- Tab 1: video trực tiếp ---
-with tab_live:
-    st.write("Bấm **START**, cho phép camera, rồi đưa mã QR vào khung. Tự động nhận, không cần chụp.")
-    if st.session_state.raw is None:
-        ctx = webrtc_streamer(
-            key="live",
-            mode=WebRtcMode.SENDRECV,
-            video_processor_factory=QRProcessor,
-            rtc_configuration=RTC_CONFIG,
-            media_stream_constraints={
-                "video": {
-                    "facingMode": "environment",
-                    "width": {"ideal": 1920},
-                    "height": {"ideal": 1080},
-                    "advanced": [{"focusMode": "continuous"}],
-                },
-                "audio": False,
-            },
-            async_processing=True,
+    with tab_live:
+        st.write(
+            "Bấm **Bật camera**, đưa **mặt sau CCCD (có mã QR)** vào khung. "
+            "Tự nhận ngay, không cần bấm chụp. Camera chạy ở độ phân giải cao nên đọc được mã QR dày."
         )
-        # Chờ kết quả từ luồng video
-        while ctx.state.playing:
-            vp = ctx.video_processor
-            if vp is not None and vp.result:
-                st.session_state.raw = vp.result
-                st.rerun()
-            time.sleep(0.15)
-    else:
-        if st.button("🔄 Quét thẻ khác"):
-            st.session_state.raw = None
-            st.rerun()
+        val = qr_live(key=f"qr_live_{st.session_state.qk}", default=None)
+        if val and val.get("t") != st.session_state.last_t:
+            st.session_state.last_t = val["t"]
+            if val.get("type") == "text":
+                if is_cccd(val["text"]):
+                    set_result(val["text"], f"trình duyệt ({val.get('w')}×{val.get('h')})")
+                else:
+                    st.warning("Có mã QR nhưng không phải QR của CCCD.")
+            elif val.get("type") == "image":
+                st.caption(f"Ảnh nhận được: {val.get('w')}×{val.get('h')} px")
+                scan_bgr(data_url_to_bgr(val["data"]))
 
-# --- Tab 2: chụp ảnh ---
-with tab_cam:
-    st.caption("Trên điện thoại, tab **Tải ảnh lên** cho ảnh gốc độ phân giải cao hơn nút chụp này.")
-    shot = st.camera_input("Đưa mã QR vào giữa khung, giữ nét rồi chụp")
-    if shot:
-        handle_scan(Image.open(shot))
-
-# --- Tab 3: tải ảnh / chụp bằng camera gốc ---
-with tab_up:
-    st.write("Trên điện thoại, bấm chọn rồi chọn **Chụp ảnh**: dùng camera gốc, tự lấy nét, ảnh rất nét.")
-    f = st.file_uploader("Ảnh mặt sau CCCD (có mã QR)", type=["jpg", "jpeg", "png", "webp"])
-    if f:
-        img = Image.open(f)
-        st.image(img, caption="Ảnh đầu vào", width=400)
-        handle_scan(img)
-
-# --- Kết quả ---
-if st.session_state.raw:
-    st.divider()
+    with tab_up:
+        st.write(
+            "Trên điện thoại: bấm chọn file rồi chọn **Chụp ảnh** để dùng camera gốc "
+            "(ảnh lớn, tự lấy nét). Đừng dùng ảnh đã gửi qua Zalo/Messenger vì bị nén nhỏ."
+        )
+        f = st.file_uploader("Ảnh mặt sau CCCD (có mã QR)", type=["jpg", "jpeg", "png", "webp"])
+        if f:
+            img = Image.open(f)
+            st.image(img, caption=f"Ảnh đầu vào ({img.width}×{img.height} px)", width=400)
+            scan_bgr(pil_to_bgr(img))
+else:
     show_result(st.session_state.raw)
     if st.session_state.get("method"):
         st.caption(f"Đọc bằng: {st.session_state.method}")
-    if st.button("🔄 Quét thẻ khác", key="reset_bottom"):
+    if st.button("🔄 Quét thẻ khác"):
         st.session_state.raw = None
+        st.session_state.last_t = None
+        st.session_state.qk += 1
         st.rerun()

@@ -6,6 +6,8 @@ Xử lý ảnh: gốc -> thu nhỏ -> tăng tương phản -> làm nét -> phón
            -> nhị phân hóa -> khử mờ Wiener -> cắt giữa.
 """
 import time
+import urllib.request
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -23,14 +25,45 @@ except Exception:
 
 MAX_SIDE = 1600
 _wechat = None
+WECHAT_SR = False  # True nếu đã nạp được mô hình siêu phân giải
 _std = cv2.QRCodeDetector()
 
 
+_MODEL_URL = "https://raw.githubusercontent.com/WeChatCV/opencv_3rdparty/wechat_qrcode/"
+_MODEL_FILES = ("detect.prototxt", "detect.caffemodel", "sr.prototxt", "sr.caffemodel")
+_MODEL_DIR = Path(__file__).parent / "models"
+
+
+def _ensure_models():
+    """Tải (1 lần) mô hình siêu phân giải của WeChat. Lỗi mạng thì bỏ qua."""
+    try:
+        _MODEL_DIR.mkdir(exist_ok=True)
+        for name in _MODEL_FILES:
+            p = _MODEL_DIR / name
+            if not p.exists() or p.stat().st_size == 0:
+                urllib.request.urlretrieve(_MODEL_URL + name, p)
+        return [str(_MODEL_DIR / n) for n in _MODEL_FILES]
+    except Exception:
+        return None
+
+
 def _get_wechat():
-    global _wechat
+    global _wechat, WECHAT_SR
     if _wechat is None:
         cls = getattr(cv2, "wechat_qrcode_WeChatQRCode", None)
-        _wechat = cls() if cls else False
+        if not cls:
+            _wechat = False
+        else:
+            _wechat = None
+            files = _ensure_models()
+            if files:
+                try:
+                    _wechat = cls(*files)
+                    WECHAT_SR = True
+                except Exception:
+                    _wechat = None
+            if _wechat is None:
+                _wechat = cls()
     return _wechat
 
 
@@ -160,8 +193,13 @@ def _stages(gray):
     sh = _unsharp(gray)
     yield "làm nét", sh
 
-    if m < 1200:
-        yield "phóng to 2x", cv2.resize(sh, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    # Ảnh nhỏ/bị nén (kiểu Zalo): phóng to rồi mới làm nét -> đọc được cả QR ~1.5px/ô
+    for f in (2, 3, 4):
+        if m * f <= 3200:
+            up = cv2.resize(gray, None, fx=f, fy=f, interpolation=cv2.INTER_LANCZOS4)
+            yield f"phóng to {f}x + làm nét", _unsharp(up, 1.5, f * 1.2)
+            if f == 2:
+                yield "phóng to 2x", up
 
     _, otsu = cv2.threshold(sh, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     yield "nhị phân Otsu", otsu
