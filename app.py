@@ -11,7 +11,14 @@ from PIL import Image, ImageOps
 
 from cccd import decode_so_cccd, kiem_tra_khop, parse_cccd
 from qr_html import QR_HTML
-from scanner import decode_image, diagnose, is_cccd, pad_quiet_zone
+import scanner as _sc
+
+decode_image = _sc.decode_image
+is_cccd = _sc.is_cccd
+# Dự phòng: nếu scanner.py trên Git là bản cũ thì app vẫn chạy được, chỉ thiếu tính năng mới
+pad_quiet_zone = getattr(_sc, "pad_quiet_zone", lambda img: img)
+diagnose = getattr(_sc, "diagnose", None)
+SCANNER_OUTDATED = diagnose is None or not hasattr(_sc, "pad_quiet_zone")
 
 st.set_page_config(page_title="Quét QR CCCD", page_icon="🪪", layout="centered")
 
@@ -50,6 +57,8 @@ def set_result(raw: str, method: str):
 
 def show_diag(bgr):
     """Bảng chẩn đoán: cho thấy bộ quét 'nhìn' ảnh ra sao và vì sao có thể thất bại."""
+    if diagnose is None:
+        return
     d = diagnose(bgr)
     with st.expander("🔎 Chẩn đoán chi tiết (xem ảnh mà bộ quét nhìn thấy)", expanded=True):
         st.image(d["view"], caption="Vùng quét sau khi phóng to + làm nét. Bạn có thấy rõ từng ô vuông nhỏ không?",
@@ -177,6 +186,10 @@ def show_result(raw: str):
 # ---------- Giao diện ----------
 st.title("🪪 Quét QR CCCD")
 st.caption("Đọc và hiển thị toàn bộ thông tin trong mã QR trên căn cước công dân.")
+
+if SCANNER_OUTDATED:
+    st.warning("File **scanner.py** trên Git là bản cũ, hãy cập nhật bản mới để dùng đủ tính năng "
+               "(chọn vùng QR, chẩn đoán, khử chói).")
 
 for k, v0 in (("raw", None), ("method", None), ("qk", 0), ("last_t", None)):
     st.session_state.setdefault(k, v0)
