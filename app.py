@@ -1,4 +1,5 @@
 import base64
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -9,14 +10,23 @@ import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 
 from cccd import decode_so_cccd, kiem_tra_khop, parse_cccd
+from qr_html import QR_HTML
 from scanner import decode_image, is_cccd
 
 st.set_page_config(page_title="Quét QR CCCD", page_icon="🪪", layout="centered")
 
-# Component quét ngay trong trình duyệt (camera độ phân giải cao)
-qr_live = components.declare_component(
-    "qr_live", path=str(Path(__file__).parent / "qr_component")
-)
+def _make_component():
+    """Ghi HTML nhúng sẵn ra thư mục tạm rồi khai báo component. Lỗi thì trả None."""
+    try:
+        d = Path(tempfile.gettempdir()) / "cccd_qr_component"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "index.html").write_text(QR_HTML, encoding="utf-8")
+        return components.declare_component("qr_live", path=str(d))
+    except Exception:
+        return None
+
+
+qr_live = _make_component()  # camera độ phân giải cao chạy trong trình duyệt
 
 MIN_SIDE_OK = 1000  # cạnh dài tối thiểu để đọc được QR dày của CCCD
 
@@ -107,7 +117,9 @@ if st.session_state.raw is None:
             "Bấm **Bật camera**, đưa **mặt sau CCCD (có mã QR)** vào khung. "
             "Tự nhận ngay, không cần bấm chụp. Camera chạy ở độ phân giải cao nên đọc được mã QR dày."
         )
-        val = qr_live(key=f"qr_live_{st.session_state.qk}", default=None)
+        val = qr_live(key=f"qr_live_{st.session_state.qk}", default=None) if qr_live else None
+        if qr_live is None:
+            st.warning("Không khởi tạo được camera trực tiếp. Hãy dùng tab **Chụp / tải ảnh**.")
         if val and val.get("t") != st.session_state.last_t:
             st.session_state.last_t = val["t"]
             if val.get("type") == "text":
